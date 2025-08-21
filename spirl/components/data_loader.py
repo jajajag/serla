@@ -7,7 +7,8 @@ import numpy as np
 import torch.utils.data as data
 import itertools
 
-from spirl.utils.general_utils import AttrDict, map_dict, maybe_retrieve, shuffle_with_seed
+from spirl.utils.general_utils import AttrDict, map_dict, maybe_retrieve, \
+        shuffle_with_seed
 from spirl.utils.pytorch_utils import RepeatedDataLoader
 from spirl.utils.video_utils import resize_video
 
@@ -344,3 +345,17 @@ class RandomVideoDataset(GeneratedVideoDataset):
         data_dict.actions = np.random.rand(self.spec['max_seq_len'] - 1, self.spec['n_actions']).astype(np.float32)
 
         return data_dict
+
+def make_dual_train_loaders(expert_root, general_root, data_conf, batch_size, n_repeat):
+    expert_ds = GlobalSplitVideoDataset(
+        data_dir=expert_root, data_conf=data_conf, phase='train', shuffle=True
+    )
+    unlabeled_ds = GlobalSplitVideoDataset(
+        data_dir=general_root, data_conf=data_conf, phase='train', shuffle=True
+    )
+    return AttrDict(
+        expert_loader=expert_ds.get_data_loader(
+            batch_size=batch_size, n_repeat=n_repeat),
+        unlabeled_loader=unlabeled_ds.get_data_loader(
+            batch_size=batch_size, n_repeat=n_repeat),
+    )

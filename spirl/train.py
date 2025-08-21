@@ -15,10 +15,10 @@ from functools import partial
 from spirl.components.data_loader import RandomVideoDataset
 from spirl.utils.general_utils import RecursiveAverageMeter, map_dict
 from spirl.components.checkpointer import CheckpointHandler, save_cmd, save_git, get_config_path
-from spirl.utils.general_utils import dummy_context, AttrDict, get_clipped_optimizer, \
-                                                        AverageMeter, ParamDict
-from spirl.utils.pytorch_utils import LossSpikeHook, NanGradHook, NoneGradHook, \
-                                                        DataParallelWrapper, RAdam
+from spirl.utils.general_utils import dummy_context, AttrDict, \
+        get_clipped_optimizer, AverageMeter, ParamDict
+from spirl.utils.pytorch_utils import LossSpikeHook, NanGradHook, NoneGradHook,\
+        DataParallelWrapper, RAdam
 from spirl.components.trainer_base import BaseTrainer
 from spirl.utils.wandb import WandBLogger
 from spirl.components.params import get_args
@@ -122,49 +122,102 @@ class ModelTrainer(BaseTrainer):
 
     def train_epoch(self, epoch):
         self.model.train()
-        epoch_len = len(self.train_loader)
+    
+        if isinstance(self.train_loader, AttrDict):
+            expert_loader = self.train_loader.expert_loader
+            unlabeled_loader = self.train_loader.unlabeled_loader
+            epoch_len = min(len(expert_loader), len(unlabeled_loader))
+            expert_iter = iter(expert_loader)
+            unlabeled_iter = iter(unlabeled_loader)
+            use_dual = True
+        else:
+            epoch_len = len(self.train_loader)
+            train_iter = iter(self.train_loader)
+            use_dual = False
+    
         end = time.time()
         batch_time = AverageMeter()
         upto_log_time = AverageMeter()
         data_load_time = AverageMeter()
         self.log_outputs_interval = self.args.log_interval
         self.log_images_interval = int(epoch_len / self.args.per_epoch_img_logs)
-        
+    
         print('starting epoch ', epoch)
-
-        for self.batch_idx, sample_batched in enumerate(self.train_loader):
+    
+        for self.batch_idx in range(epoch_len):
+            if use_dual:
+                try:
+                    expert_batch = next(expert_iter)
+                except StopIteration:
+                    expert_iter = iter(expert_loader)
+                    expert_batch = next(expert_iter)
+                try:
+                    unlabeled_batch = next(unlabeled_iter)
+                except StopIteration:
+                    unlabeled_iter = iter(unlabeled_loader)
+                    unlabeled_batch = next(unlabeled_iter)
+                sample_batched = expert_batch
+            else:
+                try:
+                    sample_batched = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(self.train_loader)
+                    sample_batched = next(train_iter)
+                unlabeled_batch = None
+    
             data_load_time.update(time.time() - end)
+    
             inputs = AttrDict(map_dict(lambda x: x.to(self.device), sample_batched))
             with self.training_context():
+                # ====== G step ======
+                for p in self.model.disc.parameters():
+                    p.requires_grad_(False)
+                
                 self.optimizer.zero_grad()
-                output = self.model(inputs)
-                losses = self.model.loss(output, inputs)
-                losses.total.value.backward()
+                output = self.model(inputs)  # 重新 forward 最稳妥
+                losses = self.model.loss(output, inputs, AttrDict(map_dict(
+                    lambda x: x.to(self.device), unlabeled_batch)) \
+                            if unlabeled_batch is not None else None)
+                losses.gen_total.value.backward()
                 self.call_hooks(inputs, output, losses, epoch)
-
                 if self.global_step < self._hp.init_grad_clip_step:
-                    # clip gradients in initial steps to avoid NaN gradients
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self._hp.init_grad_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self._hp.init_grad_clip)
+                self.optimizer.step()
+                
+                # ====== D step ======
+                for p in self.model.disc.parameters():
+                    p.requires_grad_(True)
+                
+                self.optimizer.zero_grad()
+                # 判别器只需要它相关的路径；可复用 output/重新 forward 均可，这里重算最安全
+                output = self.model(inputs)
+                losses = self.model.loss(output, inputs, AttrDict(map_dict(
+                    lambda x: x.to(self.device), unlabeled_batch)) \
+                            if unlabeled_batch is not None else None)
+                losses.disc_total.value.backward()
                 self.optimizer.step()
                 self.model.step()
-
+    
             if self.args.train_loop_pdb:
                 import pdb; pdb.set_trace()
-            
+    
             upto_log_time.update(time.time() - end)
             if self.log_outputs_now and not self.args.dont_save:
                 self.model.log_outputs(output, inputs, losses, self.global_step,
-                                       log_images=self.log_images_now, phase='train', **self._logging_kwargs)
+                                       log_images=self.log_images_now, 
+                                       phase='train', **self._logging_kwargs)
             batch_time.update(time.time() - end)
             end = time.time()
-            
+    
             if self.log_outputs_now:
-                print('GPU {}: {}'.format(os.environ["CUDA_VISIBLE_DEVICES"] if self.use_cuda else 'none',
-                                          self._hp.exp_path))
+                cuda_str = os.environ.get("CUDA_VISIBLE_DEVICES", "auto") \
+                        if self.use_cuda else "none"
+                print('GPU {}: {}'.format(cuda_str, self._hp.exp_path))
                 print(('itr: {} Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                        self.global_step, epoch, self.batch_idx, len(self.train_loader),
-                        100. * self.batch_idx / len(self.train_loader), losses.total.value.item())))
-
+                        self.global_step, epoch, self.batch_idx, epoch_len,
+                        100. * self.batch_idx / epoch_len, losses.total.value.item())))
+    
                 print('avg time for loading: {:.2f}s, logs: {:.2f}s, compute: {:.2f}s, total: {:.2f}s'
                       .format(data_load_time.avg,
                               batch_time.avg - upto_log_time.avg,
@@ -172,7 +225,7 @@ class ModelTrainer(BaseTrainer):
                               batch_time.avg))
                 togo_train_time = batch_time.avg * (self._hp.num_epochs - epoch) * epoch_len / 3600.
                 print('ETA: {:.2f}h'.format(togo_train_time))
-
+    
             del output, losses
             self.global_step = self.global_step + 1
 
@@ -227,6 +280,27 @@ class ModelTrainer(BaseTrainer):
         conf_module = imp.load_source('conf', conf.conf_path)
         conf.general = conf_module.configuration
         conf.model = conf_module.model_config
+
+        try:
+            from spirl.configs.skill_prior_learning.pu_defaults \
+                    import pu_defaults
+            if isinstance(conf.general, dict):
+                conf.general.update(pu_defaults)
+            else:
+                for k, v in pu_defaults.items():
+                    conf.general[k] = v
+        except Exception:
+            pass
+
+            # ---- set defaults for expert_root/general_root ----
+        if 'expert_root' not in conf.general or conf.general['expert_root'] \
+                is None:
+            conf.general['expert_root'] = conf.general['data_dir']
+
+        if 'general_root' not in conf.general or conf.general['general_root'] \
+                is None:
+            print("[PU] general_root not set, running in expert-only mode.")
+
 
         # data config
         try:
@@ -296,7 +370,8 @@ class ModelTrainer(BaseTrainer):
             #model = DataParallelWrapper(model)
         model = model.to(self.device)
         model.device = self.device
-        loader = self.get_dataset(self.args, model, self.conf.data, phase, params.n_repeat, params.dataset_size)
+        loader = self.get_dataset(self.args, model, self.conf.data, phase, 
+                                  params.n_repeat, params.dataset_size)
         return logger, model, loader
 
     def get_dataset(self, args, model, data_conf, phase, n_repeat, dataset_size=-1):
@@ -305,8 +380,28 @@ class ModelTrainer(BaseTrainer):
         else:
             dataset_class = data_conf.dataset_spec.dataset_class
 
-        loader = dataset_class(self._hp.data_dir, data_conf, resolution=model.resolution,
-                               phase=phase, shuffle=phase == "train", dataset_size=dataset_size). \
+        if (phase == "train" \
+                and getattr(self._hp, "expert_root", None) is not None \
+                and getattr(self._hp, "general_root", None) is not None):
+            expert_ds = dataset_class(self._hp.expert_root, data_conf, 
+                                      resolution=model.resolution,
+                                      phase='train', shuffle=True, 
+                                      dataset_size=dataset_size)
+            unlabeled_ds = dataset_class(self._hp.general_root, data_conf, 
+                                         resolution=model.resolution,
+                                         phase='train', shuffle=True, 
+                                         dataset_size=dataset_size)
+            expert_loader = expert_ds.get_data_loader(self._hp.batch_size, 
+                                                      n_repeat)
+            unlabeled_loader = unlabeled_ds.get_data_loader(self._hp.batch_size,
+                                                            n_repeat)
+            return AttrDict(expert_loader=expert_loader, 
+                            unlabeled_loader=unlabeled_loader)
+
+        loader = dataset_class(self._hp.data_dir, data_conf, 
+                               resolution=model.resolution,
+                               phase=phase, shuffle=phase == "train", 
+                               dataset_size=dataset_size). \
             get_data_loader(self._hp.batch_size, n_repeat)
 
         return loader

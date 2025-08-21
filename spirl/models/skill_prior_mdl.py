@@ -15,14 +15,17 @@ from spirl.modules.losses import KLDivLoss, NLL
 from spirl.modules.subnetworks import BaseProcessingLSTM, Predictor, Encoder
 from spirl.modules.recurrent_modules import RecurrentPredictor
 from spirl.utils.general_utils import AttrDict, ParamDict, split_along_axis, get_clipped_optimizer
-from spirl.utils.pytorch_utils import map2np, ten2ar, RemoveSpatial, ResizeSpatial, map2torch, find_tensor, \
-                                        TensorModule, RAdam
+from spirl.utils.pytorch_utils import map2np, ten2ar, RemoveSpatial, \
+        ResizeSpatial, map2torch, find_tensor, TensorModule, RAdam
 from spirl.utils.vis_utils import fig2img
-from spirl.modules.variational_inference import ProbabilisticModel, Gaussian, MultivariateGaussian, get_fixed_prior, \
-                                                mc_kl_divergence
+from spirl.modules.variational_inference import ProbabilisticModel, Gaussian, \
+        MultivariateGaussian, get_fixed_prior, mc_kl_divergence
 from spirl.modules.layers import LayerBuilderParams
 from spirl.modules.mdn import MDN, GMM
 from spirl.modules.flow_models import ConditionedFlowModel
+from spirl.models.pu_discriminator import PUDiscriminator
+from spirl.models.pu_loss import pu_risk
+from spirl.models.sde import add_skill_noise
 
 
 class SkillPriorMdl(BaseModel, ProbabilisticModel):
@@ -36,6 +39,10 @@ class SkillPriorMdl(BaseModel, ProbabilisticModel):
         self.device = self._hp.device
 
         self.build_network()
+
+        # Initialize PU discriminator
+        self.disc = PUDiscriminator(self._hp.nz_vae, 
+            hidden_sizes=self._hp.disc_hidden).to(self.device)
 
         # optionally: optimize beta with dual gradient descent
         if self._hp.target_kl is not None:
@@ -93,6 +100,23 @@ class SkillPriorMdl(BaseModel, ProbabilisticModel):
             'embedding_checkpoint': None,   # optional, if provided loads weights for encoder, decoder and freezes it
         })
 
+        # ==== PU & SDE Hyperparameters ====
+        default_dict.update({
+            # PU (nnPU)
+            'pu_lambda': 0.6,          # lambda
+            'pu_xi': 0.2,              # nnPU's non-neg LB ξ
+            #'pu_xi': 0.0,              # nnPU's non-neg LB ξ
+            'pu_weight': 1.0,          # ρ: PU loss weight
+        
+            # Discriminator and its optimizer
+            'disc_hidden': (256, 256), # Hidden layers of discriminator
+            # If we need a separate discriminator optimizer, add 'lr_disc': 3e-4
+        
+            # SDE（skill-level data enhancement）
+            'sde_sigma_prior': 1e-2,   # Gaussian noise σ for prior
+            'sde_alpha': 1.0,          # SDE's trade-off parameter α
+        })
+
         # add new params to parent params
         parent_params = super()._default_hparams()
         parent_params.overwrite(default_dict)
@@ -141,29 +165,71 @@ class SkillPriorMdl(BaseModel, ProbabilisticModel):
                                             inputs=inputs)
         return output
 
-    def loss(self, model_output, inputs):
-        """Loss computation of the SPIRL model.
-        :arg model_output: output of SPIRL model forward pass
-        :arg inputs: dict with 'states', 'actions', 'images' keys from data loader
-        """
+    def loss(self, model_output, inputs, unlabeled_inputs=None):
+        """Compute total loss with optional SDE & PU terms."""
         losses = AttrDict()
-
-        # reconstruction loss, assume unit variance model output Gaussian
-        losses.rec_mse = NLL(self._hp.reconstruction_mse_weight) \
-            (Gaussian(model_output.reconstruction, torch.zeros_like(model_output.reconstruction)),
-             self._regression_targets(inputs))
-
-        # KL loss
+    
+        # 1) reconstruction
+        losses.rec_mse = NLL(self._hp.reconstruction_mse_weight)(
+            Gaussian(model_output.reconstruction, torch.zeros_like(model_output.reconstruction)),
+            self._regression_targets(inputs)
+        )
+    
+        # 2) KL
         losses.kl_loss = KLDivLoss(self.beta)(model_output.q, model_output.p)
-
-        # learned skill prior net loss
+    
+        # 3) learned prior aux
         losses.q_hat_loss = self._compute_learned_prior_loss(model_output)
-
-        # Optionally update beta
+    
+        # 4) SDE (只放到自定义组合里；在 base_total 里权重设 0.0)
+        z_p = model_output.p.sample()
+        z_p_noisy = add_skill_noise(z_p, sigma=self._hp.sde_sigma_prior)
+        sde_val = torch.mean((z_p_noisy - z_p) ** 2)
+        losses.sde = AttrDict(value=sde_val, weight=0.0)
+    
+        # 5) PU (nnPU)（同样不给 base_total 计权）
+        if self.training and (unlabeled_inputs is not None) and self._hp.pu_weight > 0.0:
+            z_e = model_output.q.sample()
+            q_u = self._run_inference(unlabeled_inputs)
+            z_u = q_u.sample()
+    
+            pu_gen  = pu_risk(self.disc(z_e),          self.disc(z_u),
+                              lambda_p=self._hp.pu_lambda, xi=self._hp.pu_xi)
+            pu_disc = pu_risk(self.disc(z_e.detach()), self.disc(z_u.detach()),
+                              lambda_p=self._hp.pu_lambda, xi=self._hp.pu_xi)
+    
+            losses.pu_gen  = AttrDict(value=pu_gen,  weight=0.0)
+            losses.pu_disc = AttrDict(value=pu_disc, weight=0.0)
+        else:
+            zero = torch.tensor(0., device=self.device)
+            losses.pu_gen  = AttrDict(value=zero, weight=0.0)
+            losses.pu_disc = AttrDict(value=zero, weight=0.0)
+    
+        # 6) 可选 beta 调整
         if self.training and self._hp.target_kl is not None:
             self._update_beta(losses.kl_loss.value)
+    
+        # 7) 先算 base_total（只会累加有 weight>0 的条目，如 rec/kl/q_hat）
+        base_total = self._compute_total_loss(losses)          # AttrDict(...)
+        base_val   = base_total.value                          # 标量张量
+    
+        # 8) 手工组合 SDE/PU（注意都用 .value）
+        total_val = base_val \
+            + self._hp.sde_alpha * losses.sde.value \
+            - self._hp.pu_weight * losses.pu_gen.value \
+            + self._hp.pu_weight * losses.pu_disc.value
 
-        losses.total = self._compute_total_loss(losses)
+        # === 新增：显式暴露 G / D 两个子目标 ===
+        losses.gen_total  = AttrDict(
+            value= base_val + self._hp.sde_alpha * losses.sde.value
+                   - self._hp.pu_weight * losses.pu_gen.value
+        )
+        losses.disc_total = AttrDict(
+            value= self._hp.pu_weight * losses.pu_disc.value
+        )
+    
+        # 9) 按训练循环的约定，暴露 losses.total.value 供 backward()
+        losses.total = AttrDict(value=total_val)
         return losses
 
     def _log_outputs(self, model_output, inputs, losses, step, log_images, phase, logger, **logging_kwargs):
