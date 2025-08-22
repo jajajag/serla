@@ -3,3 +3,4 @@ __pycache__
 *.egg-info
 /spirl/data_d4rl_general
 /spirl/exp
+*.swp

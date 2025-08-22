@@ -30,9 +30,13 @@ class KitchenEnv(GymEnv):
 
     def _postprocess_info(self, info):
         """Sorts solved subtasks into separately logged elements."""
-        completed_subtasks = info.pop("completed_tasks")
+        if "completed_tasks" not in info:
+            completed_subtasks = []
+        else:
+            completed_subtasks = info.pop("completed_tasks")
         for task in self.SUBTASKS:
-            self.solved_subtasks[task] = 1 if task in completed_subtasks or self.solved_subtasks[task] else 0
+            self.solved_subtasks[task] = 1 if task in completed_subtasks \
+                    or self.solved_subtasks[task] else 0
         return info
 
 

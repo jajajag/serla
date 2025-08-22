@@ -166,15 +166,15 @@ python -m spirl.train --path "${SP_CONF}" \
 # -------- Find latest checkpoint --------
 SP_SUBDIR="$(basename "$(dirname "${SP_CONF}")")"   # hierarchical_cl | hierarchical | flat
 CKPT_DIR="${EXP_DIR}/skill_prior_learning/${TASK}/${SP_SUBDIR}/${EXP_NAME}/weights"
-if [[ ! -d "${CKPT_DIR}" ]]; then
-  echo "[ERROR] Weights directory not found: ${CKPT_DIR}"
-  exit 1
-fi
-EPOCH=$(ls "${CKPT_DIR}" | grep -Eo '^[0-9]+' | sort -n | tail -1 || true)
-if [[ -z "${EPOCH}" ]]; then
-  echo "[ERROR] No checkpoint found in: ${CKPT_DIR}"
-  exit 1
-fi
+#if [[ ! -d "${CKPT_DIR}" ]]; then
+#  echo "[ERROR] Weights directory not found: ${CKPT_DIR}"
+#  exit 1
+#fi
+#EPOCH=$(ls "${CKPT_DIR}" | grep -Eo '^[0-9]+' | sort -n | tail -1 || true)
+#if [[ -z "${EPOCH}" ]]; then
+#  echo "[ERROR] No checkpoint found in: ${CKPT_DIR}"
+#  exit 1
+#fi
 echo "[*] Latest prior checkpoint epoch: ${EPOCH}"
 
 # -------- Optionally launch online RL (HRL + prior) --------
