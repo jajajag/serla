@@ -165,7 +165,7 @@ class RLTrainer:
         if self.is_chef:
             with timing("Eval log time: "):
                 self.agent.log_outputs(rollout_stats, val_rollout_storage,
-                                       self.logger, log_images=True, step=self.global_step)
+                                       self.logger, log_images=False, step=self.global_step)
             print("Evaluation Avg_Reward: {}".format(rollout_stats.avg_reward))
         del val_rollout_storage
 
