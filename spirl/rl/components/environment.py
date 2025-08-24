@@ -109,4 +109,4 @@ class GymEnv(BaseEnvironment):
 
     def _render_raw(self, mode):
         """Returns rendering as uint8 in range [0...255]"""
-        return np.array(self._env.render(mode=mode))
+        return self._env.render(mode=mode)
