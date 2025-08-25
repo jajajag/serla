@@ -1,4 +1,4 @@
-# Accelerating Reinforcement Learning with Learned Skill Priors
+# Skill-Enhanced Reinforcement Learning Acceleration from Heterogeneous Demonstrations
 #### [[Project Website]](https://clvrai.github.io/spirl/) [[Paper]](https://arxiv.org/abs/2010.11944)
 
 [Karl Pertsch](https://kpertsch.github.io/)<sup>1</sup>, [Youngwoon Lee](https://youngwoon.github.io/)<sup>1</sup>, 
